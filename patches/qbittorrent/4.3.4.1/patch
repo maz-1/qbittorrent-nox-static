@@ -36,3 +36,1682 @@ index 6c44bb8aa..9b059875a 100644
      // libtorrent 1.1 enables UPnP & NAT-PMP by default
      // turn them off before `lt::session` ctor to avoid split second effects
      pack.set_bool(lt::settings_pack::enable_upnp, false);
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 6709fbf3700..c7ef0ed0699 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -35,7 +35,7 @@ set_property(CACHE LibtorrentRasterbar_DIR PROPERTY TYPE PATH)
+ find_package(Boost ${minBoostVersion} REQUIRED)
+ find_package(OpenSSL ${minOpenSSLVersion} REQUIRED)
+ find_package(ZLIB ${minZlibVersion} REQUIRED)
+-find_package(Qt5 ${minQtVersion} REQUIRED COMPONENTS Core Network Xml LinguistTools)
++find_package(Qt5 ${minQtVersion} REQUIRED COMPONENTS Core Network Xml LinguistTools Sql)
+ if (DBUS)
+     find_package(Qt5 ${minQtVersion} REQUIRED COMPONENTS DBus)
+     set_package_properties(Qt5DBus PROPERTIES
+diff --git a/src/base/CMakeLists.txt b/src/base/CMakeLists.txt
+index 482e3c31ebf..f32363aaa57 100644
+--- a/src/base/CMakeLists.txt
++++ b/src/base/CMakeLists.txt
+@@ -103,6 +103,11 @@ add_library(qbt_base STATIC
+     bittorrent/nativetorrentextension.cpp
+     bittorrent/peeraddress.cpp
+     bittorrent/peerinfo.cpp
++    bittorrent/peer_blacklist.hpp
++    bittorrent/peer_filter.hpp
++    bittorrent/peer_filter_plugin.hpp
++    bittorrent/peer_filter_session_plugin.hpp
++    bittorrent/peer_logger.hpp
+     bittorrent/portforwarderimpl.cpp
+     bittorrent/resumedatasavingmanager.cpp
+     bittorrent/session.cpp
+@@ -169,7 +174,7 @@ target_link_libraries(qbt_base
+         ZLIB::ZLIB
+     PUBLIC
+         LibtorrentRasterbar::torrent-rasterbar
+-        Qt5::Core Qt5::Network Qt5::Xml
++        Qt5::Core Qt5::Network Qt5::Xml Qt5::Sql
+         qbt_common_cfg
+ )
+ 
+diff --git a/src/base/bittorrent/peer_blacklist.hpp b/src/base/bittorrent/peer_blacklist.hpp
+new file mode 100644
+index 00000000000..fc6fb1ddc70
+--- /dev/null
++++ b/src/base/bittorrent/peer_blacklist.hpp
+@@ -0,0 +1,98 @@
++#pragma once
++
++#include <regex>
++
++#include <libtorrent/torrent_info.hpp>
++
++#include <QHostAddress>
++
++#include "base/net/geoipmanager.h"
++
++#include "peer_filter_plugin.hpp"
++#include "peer_logger.hpp"
++
++// bad peer filter
++bool is_bad_peer(const lt::peer_info& info)
++{
++  std::regex id_filter("-(XL|SD|XF|QD|BN|DL)(\\d+)-");
++  std::regex ua_filter(R"((\d+.\d+.\d+.\d+|cacao_torrent))");
++  return std::regex_match(info.pid.data(), info.pid.data() + 8, id_filter) || std::regex_match(info.client, ua_filter);
++}
++
++// Unknown Peer filter
++bool is_unknown_peer(const lt::peer_info& info)
++{
++  QString country = Net::GeoIPManager::instance()->lookup(QHostAddress(info.ip.data()));
++  return info.client.find("Unknown") != std::string::npos && country == QLatin1String("CN");
++}
++
++// Offline Downloader filter
++bool is_offline_downloader(const lt::peer_info& info)
++{
++  unsigned short port = info.ip.port();
++  QString country = Net::GeoIPManager::instance()->lookup(QHostAddress(info.ip.data()));
++  return port >= 65000 && country == QLatin1String("CN") && info.client.find("Transmission") != std::string::npos;
++}
++
++// BitTorrent Media Player Peer filter
++bool is_bittorrent_media_player(const lt::peer_info& info)
++{
++  std::regex player_filter("-(UW\\w{4})-");
++  return !!std::regex_match(info.pid.data(), info.pid.data() + 8, player_filter);
++}
++
++
++// drop connection action
++void drop_connection(lt::peer_connection_handle ph)
++{
++  ph.disconnect(boost::asio::error::connection_refused, lt::operation_t::bittorrent, lt::disconnect_severity_t{0});
++}
++
++
++template<typename F>
++auto wrap_filter(F filter, const std::string& tag)
++{
++  return [=](const lt::peer_info& info, bool handshake, bool* stop_filtering) {
++    bool matched = filter(info);
++    *stop_filtering = !handshake && !matched;
++    if (matched)
++      peer_logger_singleton::instance().log_peer(info, tag);
++    return matched;
++  };
++}
++
++
++std::shared_ptr<lt::torrent_plugin> create_peer_action_plugin(
++    const lt::torrent_handle& th,
++    filter_function filter,
++    action_function action)
++{
++  // ignore private torrents
++  if (th.torrent_file() && th.torrent_file()->priv())
++    return nullptr;
++
++  return std::make_shared<peer_action_plugin>(std::move(filter), std::move(action));
++}
++
++
++// plugins factory functions
++
++std::shared_ptr<lt::torrent_plugin> create_drop_bad_peers_plugin(lt::torrent_handle const& th, client_data)
++{
++  return create_peer_action_plugin(th, wrap_filter(is_bad_peer, "bad peer"), drop_connection);
++}
++
++std::shared_ptr<lt::torrent_plugin> create_drop_unknown_peers_plugin(lt::torrent_handle const& th, client_data)
++{
++  return create_peer_action_plugin(th, wrap_filter(is_unknown_peer, "unknown peer"), drop_connection);
++}
++
++std::shared_ptr<lt::torrent_plugin> create_drop_offline_downloader_plugin(lt::torrent_handle const& th, client_data)
++{
++  return create_peer_action_plugin(th, wrap_filter(is_offline_downloader, "offline downloader"), drop_connection);
++}
++
++std::shared_ptr<lt::torrent_plugin> create_drop_bittorrent_media_player_plugin(lt::torrent_handle const& th, client_data)
++{
++  return create_peer_action_plugin(th, wrap_filter(is_bittorrent_media_player, "bittorrent media player"), drop_connection);
++}
+diff --git a/src/base/bittorrent/peer_filter.hpp b/src/base/bittorrent/peer_filter.hpp
+new file mode 100644
+index 00000000000..a830ddd77c4
+--- /dev/null
++++ b/src/base/bittorrent/peer_filter.hpp
+@@ -0,0 +1,69 @@
++#pragma once
++
++#include <algorithm>
++#include <fstream>
++#include <string>
++
++#include <QFileInfo>
++#include <QRegularExpression>
++#include <QString>
++#include <QVector>
++
++#include <libtorrent/peer_info.hpp>
++
++#include "base/logger.h"
++
++namespace {
++
++bool qregex_has_match(const QRegularExpression& re, const QString& str)
++{
++  auto m = re.match(str);
++  return m.hasMatch();
++}
++
++}
++
++class peer_filter
++{
++public:
++  explicit peer_filter(const QString& filter_file)
++  {
++    QString log_tag = QFileInfo(filter_file).fileName();
++
++    std::ifstream ifs(filter_file.toStdString());
++    std::string peer_id, client;
++    while (ifs >> peer_id >> client) {
++      QRegularExpression peer_id_re(QString::fromStdString(peer_id));
++      QRegularExpression client_re(QString::fromStdString(client));
++
++      QString msg_tmpl("'%1': invalid %2 matching expression '%3' detected at line %4, ignoring rule");
++      int line = m_filters.size() + 1;
++
++      if (!peer_id_re.isValid())
++        LogMsg(msg_tmpl.arg(log_tag).arg("peer id").arg(peer_id_re.pattern()).arg(line), Log::WARNING);
++
++      if (!client_re.isValid())
++        LogMsg(msg_tmpl.arg(log_tag).arg("client name").arg(client_re.pattern()).arg(line), Log::WARNING);
++
++      if (peer_id_re.isValid() && client_re.isValid())
++        m_filters.append({peer_id_re, client_re});
++    }
++  }
++
++  bool match_peer(const lt::peer_info& info, bool skip_name) const
++  {
++    QString peer_id = QString::fromLatin1(info.pid.data(), 8);
++    QString client = QString::fromStdString(info.client);
++    return std::any_of(m_filters.begin(), m_filters.end(),
++                       [&](const auto& filter) {
++                           return qregex_has_match(filter[0], peer_id) &&
++                               (skip_name || qregex_has_match(filter[1], client));
++                       });
++  }
++
++  bool is_empty() const { return m_filters.isEmpty(); }
++  int rules_count() const { return m_filters.size(); }
++
++private:
++  QVector<QVector<QRegularExpression>> m_filters;
++};
+diff --git a/src/base/bittorrent/peer_filter_plugin.hpp b/src/base/bittorrent/peer_filter_plugin.hpp
+new file mode 100644
+index 00000000000..ee4adfc13c5
+--- /dev/null
++++ b/src/base/bittorrent/peer_filter_plugin.hpp
+@@ -0,0 +1,123 @@
++#pragma once
++
++#include <libtorrent/extensions.hpp>
++#include <libtorrent/peer_connection_handle.hpp>
++
++#if (LIBTORRENT_VERSION_NUM >= 20000)
++using client_data = lt::client_data_t;
++#else
++using client_data = void*;
++#endif
++
++using filter_function = std::function<bool(const lt::peer_info&, bool, bool*)>;
++using action_function = std::function<void(lt::peer_connection_handle)>;
++
++class peer_filter_plugin final : public lt::peer_plugin
++{
++public:
++  peer_filter_plugin(lt::peer_connection_handle p, filter_function filter, action_function action)
++    : m_peer_connection(p)
++    , m_filter(std::move(filter))
++    , m_action(std::move(action))
++  {}
++
++  bool on_handshake(lt::span<char const> d) override
++  {
++    handle_peer(true);
++    return peer_plugin::on_handshake(d);
++  }
++
++  bool on_extension_handshake(lt::bdecode_node const& d) override
++  {
++    handle_peer(true);
++    return peer_plugin::on_extension_handshake(d);
++  }
++
++  bool on_interested() override
++  {
++    handle_peer();
++    return peer_plugin::on_interested();
++  }
++
++  bool on_not_interested() override
++  {
++    handle_peer();
++    return peer_plugin::on_not_interested();
++  }
++
++  bool on_have(lt::piece_index_t p) override
++  {
++    handle_peer();
++    return peer_plugin::on_have(p);
++  }
++
++  bool on_dont_have(lt::piece_index_t p) override
++  {
++    handle_peer();
++    return peer_plugin::on_dont_have(p);
++  }
++
++  bool on_bitfield(lt::bitfield const& bitfield) override
++  {
++    handle_peer();
++    return peer_plugin::on_bitfield(bitfield);
++  }
++
++  bool on_have_all() override
++  {
++    handle_peer();
++    return peer_plugin::on_have_all();
++  }
++
++  bool on_have_none() override
++  {
++    handle_peer();
++    return peer_plugin::on_have_none();
++  }
++
++  bool on_request(lt::peer_request const& r) override
++  {
++    handle_peer();
++    return peer_plugin::on_request(r);
++  }
++
++protected:
++  void handle_peer(bool handshake = false)
++  {
++    if (m_stop_filtering)
++      return;
++
++    lt::peer_info info;
++    m_peer_connection.get_peer_info(info);
++
++    if (m_filter(info, handshake, &m_stop_filtering))
++      m_action(m_peer_connection);
++  }
++
++private:
++  lt::peer_connection_handle m_peer_connection;
++
++  filter_function m_filter;
++  action_function m_action;
++
++  bool m_stop_filtering = false;
++};
++
++
++class peer_action_plugin : public lt::torrent_plugin
++{
++public:
++  peer_action_plugin(filter_function filter, action_function action)
++    : m_filter(std::move(filter))
++    , m_action(std::move(action))
++  {}
++
++  std::shared_ptr<lt::peer_plugin> new_connection(lt::peer_connection_handle const& p) override
++  {
++    return std::make_shared<peer_filter_plugin>(p, m_filter, m_action);
++  }
++
++private:
++  filter_function m_filter;
++  action_function m_action;
++};
+diff --git a/src/base/bittorrent/peer_filter_session_plugin.hpp b/src/base/bittorrent/peer_filter_session_plugin.hpp
+new file mode 100644
+index 00000000000..36de2a90d58
+--- /dev/null
++++ b/src/base/bittorrent/peer_filter_session_plugin.hpp
+@@ -0,0 +1,85 @@
++#pragma once
++
++#include <QDir>
++
++#include "base/logger.h"
++#include "base/profile.h"
++
++#include "peer_filter_plugin.hpp"
++#include "peer_filter.hpp"
++#include "peer_logger.hpp"
++
++// filter factory function
++std::unique_ptr<peer_filter> create_peer_filter(const QString& filename)
++{
++  QDir qbt_data_dir(specialFolderLocation(SpecialFolder::Data));
++
++  QString filter_file = qbt_data_dir.absoluteFilePath(filename);
++  // do not create plugin if filter file doesn't exists
++  if (!QFile::exists(filter_file)) {
++    LogMsg(QString("'%1' doesn't exist, do not enabling filter").arg(filename), Log::NORMAL);
++    return nullptr;
++  }
++
++  auto filter = std::make_unique<peer_filter>(filter_file);
++  if (filter->is_empty()) {
++    LogMsg(QString("'%1' has no valid rules, do not enabling filter").arg(filename), Log::WARNING);
++    filter.reset();
++  } else {
++    LogMsg(QString("'%1' contains %2 valid rules").arg(filename).arg(filter->rules_count()), Log::INFO);
++  }
++
++  return filter;
++}
++
++
++// drop connection action
++void drop_peer_connection(lt::peer_connection_handle ph)
++{
++  ph.disconnect(boost::asio::error::connection_refused, lt::operation_t::bittorrent, lt::disconnect_severity_t{0});
++}
++
++
++class peer_filter_session_plugin final : public lt::plugin
++{
++public:
++  peer_filter_session_plugin()
++    : m_blacklist(create_peer_filter(QStringLiteral("peer_blacklist.txt")))
++    , m_whitelist(create_peer_filter(QStringLiteral("peer_whitelist.txt")))
++  {
++  }
++
++  std::shared_ptr<lt::torrent_plugin> new_torrent(const lt::torrent_handle&, client_data) override
++  {
++    // do not waste CPU and memory for useless objects when no filters are enabled
++    if (!m_blacklist && !m_whitelist)
++      return nullptr;
++    return std::make_shared<peer_action_plugin>([this](auto&&... args) { return filter(args...); }, drop_peer_connection);
++  }
++
++protected:
++  bool filter(const lt::peer_info& info, bool handshake, bool* stop_filtering) const
++  {
++    if (m_blacklist) {
++      bool matched = m_blacklist->match_peer(info, false);
++      *stop_filtering = !handshake && !matched;
++      if (matched)
++        peer_logger_singleton::instance().log_peer(info, "blacklist");
++      return matched;
++    }
++
++    if (m_whitelist) {
++      bool matched = m_whitelist->match_peer(info, handshake);
++      *stop_filtering = !handshake && matched;
++      if (!matched)
++        peer_logger_singleton::instance().log_peer(info, "whitelist");
++      return !matched;
++    }
++
++    return false;
++  }
++
++private:
++  std::unique_ptr<peer_filter> m_blacklist;
++  std::unique_ptr<peer_filter> m_whitelist;
++};
+diff --git a/src/base/bittorrent/peer_logger.hpp b/src/base/bittorrent/peer_logger.hpp
+new file mode 100644
+index 00000000000..c31e00e8d9f
+--- /dev/null
++++ b/src/base/bittorrent/peer_logger.hpp
+@@ -0,0 +1,104 @@
++#pragma once
++
++#include <libtorrent/peer_info.hpp>
++
++#include <QSqlDatabase>
++#include <QSqlQuery>
++
++#include <QVariant>
++
++
++class db_connection
++{
++public:
++  static db_connection& instance()
++  {
++    static db_connection c;
++    return c;
++  }
++
++  void init(const QString& db_path)
++  {
++    m_db.setDatabaseName(db_path);
++    m_db.open();
++  }
++
++  QSqlDatabase connection() const
++  {
++    return m_db;
++  }
++
++protected:
++  db_connection()
++    : m_db(QSqlDatabase::addDatabase("QSQLITE"))
++  {}
++
++  ~db_connection()
++  {
++    m_db.close();
++  }
++
++private:
++  QSqlDatabase m_db;
++};
++
++
++class peer_logger
++{
++public:
++  explicit peer_logger(QSqlDatabase db, QString table)
++    : m_db(db)
++    , m_table(table)
++  {
++    if (!db.tables().contains(table)) {
++      db.exec(QString(
++                "CREATE TABLE '%1' ("
++                "    'id'      INTEGER PRIMARY KEY,"
++                "    'ip'      TEXT NOT NULL UNIQUE,"
++                "    'client'  TEXT NOT NULL,"
++                "    'pid'     BLOB NOT NULL,"
++                "    'tag'     TEXT"
++                ");").arg(table));
++      db.commit();
++    }
++  }
++
++  bool log_peer(const lt::peer_info& info, const std::string& tag = {})
++  {
++    QSqlQuery q(m_db);
++    q.prepare(QString("INSERT INTO '%1' (ip, client, pid, tag) VALUES (?, ?, ?, ?)").arg(m_table));
++    q.addBindValue(QString::fromStdString(info.ip.address().to_string()));
++    q.addBindValue(QString::fromStdString(info.client));
++    q.addBindValue(QString::fromLatin1(info.pid.data(), 8));
++    q.addBindValue(QString::fromStdString(tag));
++    return q.exec();
++  }
++
++private:
++  QSqlDatabase m_db;
++  QString m_table;
++};
++
++
++class peer_logger_singleton
++{
++public:
++  static peer_logger_singleton& instance()
++  {
++    static peer_logger_singleton logger;
++    return logger;
++  }
++
++  void log_peer(const lt::peer_info& info, const std::string& tag)
++  {
++    m_logger.log_peer(info, tag);
++  }
++
++protected:
++  peer_logger_singleton()
++    : m_logger(db_connection::instance().connection(), QStringLiteral("banned_peers"))
++  {}
++
++private:
++  peer_logger m_logger;
++};
+diff --git a/src/base/bittorrent/peerinfo.cpp b/src/base/bittorrent/peerinfo.cpp
+index ada9fc3437a..0a02b2a4658 100644
+--- a/src/base/bittorrent/peerinfo.cpp
++++ b/src/base/bittorrent/peerinfo.cpp
+@@ -180,6 +180,16 @@ QString PeerInfo::client() const
+     return QString::fromStdString(m_nativeInfo.client);
+ }
+ 
++QString PeerInfo::peerId() const
++{
++    // when peer ID is not known yet it contains only zero bytes,
++    // do not create string in such case, return empty string instead
++    if (*reinterpret_cast<const quint64*>(m_nativeInfo.pid.data()) == 0)
++        return {};
++    // peer ID in only first 8 bytes, the rest is not interesting
++    return QString::fromLatin1(m_nativeInfo.pid.data(), 8);
++}
++
+ qreal PeerInfo::progress() const
+ {
+     return m_nativeInfo.progress;
+diff --git a/src/base/bittorrent/peerinfo.h b/src/base/bittorrent/peerinfo.h
+index bfa5f9b2e14..c091e3d460d 100644
+--- a/src/base/bittorrent/peerinfo.h
++++ b/src/base/bittorrent/peerinfo.h
+@@ -78,6 +78,7 @@ namespace BitTorrent
+ 
+         PeerAddress address() const;
+         QString client() const;
++        QString peerId() const;
+         qreal progress() const;
+         int payloadUpSpeed() const;
+         int payloadDownSpeed() const;
+diff --git a/src/base/bittorrent/session.cpp b/src/base/bittorrent/session.cpp
+index 99439a36050..bf58fcc7f26 100644
+--- a/src/base/bittorrent/session.cpp
++++ b/src/base/bittorrent/session.cpp
+@@ -77,6 +77,7 @@
+ #include "base/logger.h"
+ #include "base/net/downloadmanager.h"
+ #include "base/net/proxyconfigurationmanager.h"
++#include "base/preferences.h"
+ #include "base/profile.h"
+ #include "base/torrentfileguard.h"
+ #include "base/torrentfilter.h"
+@@ -95,6 +96,8 @@
+ #include "ltunderlyingtype.h"
+ #include "magneturi.h"
+ #include "nativesessionextension.h"
++#include "peer_blacklist.hpp"
++#include "peer_filter_session_plugin.hpp"
+ #include "portforwarderimpl.h"
+ #include "resumedatasavingmanager.h"
+ #include "statistics.h"
+@@ -457,6 +460,10 @@ Session::Session(QObject *parent)
+                             return tmp;
+                         }
+                  )
++    , m_publicTrackers(BITTORRENT_SESSION_KEY("PublicTrackersList"))
++    , m_autoBanUnknownPeer(BITTORRENT_SESSION_KEY("AutoBanUnknownPeer"), false)
++    , m_autoBanBTPlayerPeer(BITTORRENT_SESSION_KEY("AutoBanBTPlayerPeer"), false)
++    , m_isAutoUpdateTrackersEnabled(BITTORRENT_SESSION_KEY("AutoUpdateTrackersEnabled"), false)
+ #if defined(Q_OS_WIN)
+     , m_OSMemoryPriority(BITTORRENT_KEY("OSMemoryPriority"), OSMemoryPriority::BelowNormal)
+ #endif
+@@ -500,6 +507,7 @@ Session::Session(QObject *parent)
+     enqueueRefresh();
+     updateSeedingLimitTimer();
+     populateAdditionalTrackers();
++    populatePublicTrackers();
+ 
+     enableTracker(isTrackerEnabled());
+ 
+@@ -537,6 +545,15 @@ Session::Session(QObject *parent)
+     new PortForwarderImpl {m_nativeSession};
+ 
+     initMetrics();
++
++    // Update Tracker
++    m_updateTimer = new QTimer(this);
++    m_updateTimer->setInterval(86400*1000);
++    connect(m_updateTimer, &QTimer::timeout, this, &Session::updatePublicTracker);
++    if (isAutoUpdateTrackersEnabled()) {
++        updatePublicTracker();
++        m_updateTimer->start();
++    }
+ }
+ 
+ bool Session::isDHTEnabled() const
+@@ -946,6 +963,54 @@ void Session::setTrackerEnabled(const bool enabled)
+     enableTracker(enabled);
+ }
+ 
++bool Session::isAutoUpdateTrackersEnabled() const
++{
++    return m_isAutoUpdateTrackersEnabled;
++}
++
++void Session::setAutoUpdateTrackersEnabled(bool enabled)
++{
++    m_isAutoUpdateTrackersEnabled = enabled;
++
++    if(!enabled) {
++        m_updateTimer->stop();
++    } else {
++        m_updateTimer->start();
++        updatePublicTracker();
++    }
++}
++
++QString Session::publicTrackers() const
++{
++    return m_publicTrackers;
++}
++
++void Session::setPublicTrackers(const QString &trackers)
++{
++    if (trackers != publicTrackers()) {
++        m_publicTrackers = trackers;
++        populatePublicTrackers();
++    }
++}
++
++void Session::updatePublicTracker()
++{
++    Preferences *const pref = Preferences::instance();
++    Net::DownloadManager::instance()->download({pref->customizeTrackersListUrl()}, this, &Session::handlePublicTrackerTxtDownloadFinished);
++}
++
++void Session::handlePublicTrackerTxtDownloadFinished(const Net::DownloadResult &result)
++{
++    switch (result.status) {
++        case Net::DownloadStatus::Success:
++            setPublicTrackers(QString::fromUtf8(result.data.data()));
++            Logger::instance()->addMessage("The public tracker list updated.", Log::INFO);
++            break;
++        default:
++            Logger::instance()->addMessage("Updating the public tracker list failed: " + result.errorString, Log::WARNING);
++    }
++}
++
+ qreal Session::globalMaxRatio() const
+ {
+     return m_globalMaxRatio;
+@@ -1133,6 +1198,17 @@ void Session::initializeNativeSession()
+     if (isPeXEnabled())
+         m_nativeSession->add_extension(&lt::create_ut_pex_plugin);
+ 
++    // Enhanced features
++    db_connection::instance().init(QDir(specialFolderLocation(SpecialFolder::Data)).absoluteFilePath("peers.db"));
++    m_nativeSession->add_extension(&create_drop_bad_peers_plugin);
++    if (isAutoBanUnknownPeerEnabled()) {
++        m_nativeSession->add_extension(&create_drop_unknown_peers_plugin);
++        m_nativeSession->add_extension(&create_drop_offline_downloader_plugin);
++    }
++    if (isAutoBanBTPlayerPeerEnabled())
++        m_nativeSession->add_extension(&create_drop_bittorrent_media_player_plugin);
++    m_nativeSession->add_extension(std::make_shared<peer_filter_session_plugin>());
++
+     m_nativeSession->add_extension(std::make_shared<NativeSessionExtension>());
+ }
+ 
+@@ -1621,6 +1697,18 @@ void Session::populateAdditionalTrackers()
+     }
+ }
+ 
++void Session::populatePublicTrackers()
++{
++    m_publicTrackerList.clear();
++
++    const QString trackers = publicTrackers();
++    for (QStringRef tracker : asConst(trackers.splitRef('\n'))) {
++        tracker = tracker.trimmed();
++        if (!tracker.isEmpty())
++            m_publicTrackerList.append({tracker.toString()});
++    }
++}
++
+ void Session::processShareLimits()
+ {
+     qDebug("Processing share limits...");
+@@ -3758,6 +3846,32 @@ void Session::setTrackerFilteringEnabled(const bool enabled)
+     }
+ }
+ 
++bool Session::isAutoBanUnknownPeerEnabled() const
++{
++    return m_autoBanUnknownPeer;
++}
++
++void Session::setAutoBanUnknownPeer(bool value)
++{
++    if (value != isAutoBanUnknownPeerEnabled()) {
++        m_autoBanUnknownPeer = value;
++        LogMsg(tr("Restart is required to toggle Auto Ban Unknown Client support"), Log::WARNING);
++    }
++}
++
++bool Session::isAutoBanBTPlayerPeerEnabled() const
++{
++    return m_autoBanBTPlayerPeer;
++}
++
++void Session::setAutoBanBTPlayerPeer(bool value)
++{
++    if (value != isAutoBanBTPlayerPeerEnabled()) {
++        m_autoBanBTPlayerPeer = value;
++        LogMsg(tr("Restart is required to toggle Auto Ban Bittorrent Media Player support"), Log::WARNING);
++    }
++}
++
+ bool Session::isListening() const
+ {
+     return m_nativeSession->is_listening();
+@@ -4602,6 +4716,9 @@ void Session::createTorrent(const lt::torrent_handle &nativeHandle)
+         if (isAddTrackersEnabled() && !torrent->isPrivate())
+             torrent->addTrackers(m_additionalTrackerList);
+ 
++        if (isAutoUpdateTrackersEnabled() && !torrent->isPrivate())
++            torrent->addTrackers(m_publicTrackerList);
++
+         LogMsg(tr("'%1' added to download list.", "'torrent name' was added to download list.")
+             .arg(torrent->name()));
+ 
+diff --git a/src/base/bittorrent/session.h b/src/base/bittorrent/session.h
+index c6bd8c813c5..5a0e664ec9d 100644
+--- a/src/base/bittorrent/session.h
++++ b/src/base/bittorrent/session.h
+@@ -493,6 +493,21 @@ namespace BitTorrent
+ 
+         void findIncompleteFiles(const TorrentInfo &torrentInfo, const QString &savePath) const;
+ 
++        // Auto ban Unknown Peer
++        bool isAutoBanUnknownPeerEnabled() const;
++        void setAutoBanUnknownPeer(bool value);
++
++        // Auto ban Bittorrent Media Player Peer
++        bool isAutoBanBTPlayerPeerEnabled() const;
++        void setAutoBanBTPlayerPeer(bool value);
++
++        // Trackers list
++        bool isAutoUpdateTrackersEnabled() const;
++        void setAutoUpdateTrackersEnabled(bool enabled);
++        QString publicTrackers() const;
++        void setPublicTrackers(const QString &trackers);
++        void updatePublicTracker();
++
+     signals:
+         void allTorrentsFinished();
+         void categoryAdded(const QString &categoryName);
+@@ -546,6 +561,9 @@ namespace BitTorrent
+         void networkOnlineStateChanged(bool online);
+         void networkConfigurationChange(const QNetworkConfiguration &);
+ 
++        // Public Tracker handle slots
++        void handlePublicTrackerTxtDownloadFinished(const Net::DownloadResult &result);
++
+     private:
+         struct MoveStorageJob
+         {
+@@ -630,6 +648,8 @@ namespace BitTorrent
+         void saveTorrentsQueue() const;
+         void removeTorrentsQueue() const;
+ 
++        void populatePublicTrackers();
++
+         std::vector<lt::alert *> getPendingAlerts(lt::time_duration time = lt::time_duration::zero()) const;
+ 
+         void moveTorrentStorage(const MoveStorageJob &job) const;
+@@ -739,6 +759,12 @@ namespace BitTorrent
+ #if defined(Q_OS_WIN)
+         CachedSettingValue<OSMemoryPriority> m_OSMemoryPriority;
+ #endif
++        // Enhanced Function
++        CachedSettingValue<QString> m_publicTrackers;
++        CachedSettingValue<bool> m_autoBanUnknownPeer;
++        CachedSettingValue<bool> m_autoBanBTPlayerPeer;
++        CachedSettingValue<bool> m_isAutoUpdateTrackersEnabled;
++        QTimer *m_updateTimer;
+ 
+         // Order is important. This needs to be declared after its CachedSettingsValue
+         // counterpart, because it uses it for initialization in the constructor
+@@ -748,6 +774,7 @@ namespace BitTorrent
+         int m_numResumeData = 0;
+         int m_extraLimit = 0;
+         QVector<TrackerEntry> m_additionalTrackerList;
++        QVector<TrackerEntry> m_publicTrackerList;
+         QString m_resumeFolderPath;
+         QFile *m_resumeFolderLock = nullptr;
+ 
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index ea3eec4cd16..4d7f8c0952d 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -926,6 +926,8 @@ void TorrentImpl::updateState()
+             m_state = TorrentState::PausedDownloading;
+         else if (m_session->isQueueingSystemEnabled() && isQueued())
+             m_state = TorrentState::QueuedDownloading;
++        else if (m_nativeStatus.state == lt::torrent_status::downloading_metadata) // must come after queue check
++            m_state = TorrentState::DownloadingMetadata;
+         else if (isForced())
+             m_state = TorrentState::ForcedDownloading;
+         else if (m_nativeStatus.download_payload_rate > 0)
+diff --git a/src/base/preferences.cpp b/src/base/preferences.cpp
+index 0d9d75e71db..fb293f4b2c6 100644
+--- a/src/base/preferences.cpp
++++ b/src/base/preferences.cpp
+@@ -1552,6 +1552,35 @@ void Preferences::setSpeedWidgetGraphEnable(const int id, const bool enable)
+     setValue("SpeedWidget/graph_enable_" + QString::number(id), enable);
+ }
+ 
++bool Preferences::getAutoBanUnknownPeer() const
++{
++    return value("Preferences/Advanced/AutoBanUnknownPeer", false).toBool();
++}
++
++void Preferences::setAutoBanUnknownPeer(const bool checked)
++{
++    setValue("Preferences/Advanced/AutoBanUnknownPeer", checked);
++}
++
++bool Preferences::getAutoBanBTPlayerPeer() const
++{
++    return value("Preferences/Advanced/AutoBanBTPlayerPeer", false).toBool();
++}
++
++void Preferences::setAutoBanBTPlayerPeer(const bool checked)
++{
++    setValue("Preferences/Advanced/AutoBanBTPlayerPeer", checked);
++}
++
++QString Preferences::customizeTrackersListUrl() const
++{
++    return value("Preferences/Bittorrent/CustomizeTrackersListUrl", "https://cdn.jsdelivr.net/gh/ngosang/trackerslist/trackers_best.txt").toString();
++}
++
++void Preferences::setCustomizeTrackersListUrl(const QString &trackersUrl) {
++    setValue("Preferences/Bittorrent/CustomizeTrackersListUrl", trackersUrl);
++}
++
+ void Preferences::apply()
+ {
+     if (SettingsStorage::instance()->save())
+diff --git a/src/base/preferences.h b/src/base/preferences.h
+index e7df0086140..bb09b314289 100644
+--- a/src/base/preferences.h
++++ b/src/base/preferences.h
+@@ -392,6 +392,14 @@ class Preferences : public QObject
+     bool getSpeedWidgetGraphEnable(int id) const;
+     void setSpeedWidgetGraphEnable(int id, bool enable);
+ 
++    // Enhanced option
++    bool getAutoBanUnknownPeer() const;
++    void setAutoBanUnknownPeer(const bool checked);
++    bool getAutoBanBTPlayerPeer() const;
++    void setAutoBanBTPlayerPeer(const bool checked);
++    QString customizeTrackersListUrl() const;
++    void setCustomizeTrackersListUrl(const QString &trackersUrl);
++
+ public slots:
+     void setStatusFilterState(bool checked);
+     void setCategoryFilterState(bool checked);
+diff --git a/src/base/settingsstorage.cpp b/src/base/settingsstorage.cpp
+index d9ac0a33796..db773cdf086 100644
+--- a/src/base/settingsstorage.cpp
++++ b/src/base/settingsstorage.cpp
+@@ -127,6 +127,10 @@ namespace
+             {"BitTorrent/Session/uTPEnabled", "Preferences/Bittorrent/uTP"},
+             {"BitTorrent/Session/uTPRateLimited", "Preferences/Bittorrent/uTP_rate_limited"},
+             {"BitTorrent/TrackerEnabled", "Preferences/Advanced/trackerEnabled"},
++            {"BitTorrent/Session/AutoUpdateTrackersEnabled", "Preferences/Bittorrent/AutoUpdateTrackers"},
++            {"BitTorrent/Session/PublicTrackersList", "Preferences/Bittorrent/PublicTrackersList"},
++            {"BitTorrent/Session/AutoBanUnknownPeer", "Preferences/Advanced/AutoBanUnknownPeer"},
++            {"BitTorrent/Session/AutoBanBTPlayerPeer", "Preferences/Advanced/AutoBanBTPlayePeer"},
+             {"Network/Proxy/OnlyForTorrents", "Preferences/Connection/ProxyOnlyForTorrents"},
+             {"Network/Proxy/Type", "Preferences/Connection/ProxyType"},
+             {"Network/Proxy/Authentication", "Preferences/Connection/Proxy/Authentication"},
+diff --git a/src/gui/aboutdialog.cpp b/src/gui/aboutdialog.cpp
+index 0ba83b39a69..d7a2dc523d5 100644
+--- a/src/gui/aboutdialog.cpp
++++ b/src/gui/aboutdialog.cpp
+@@ -48,7 +48,7 @@ AboutDialog::AboutDialog(QWidget *parent)
+     setAttribute(Qt::WA_DeleteOnClose);
+ 
+     // Title
+-    m_ui->labelName->setText(QString::fromLatin1("<b><h2>qBittorrent " QBT_VERSION " (%1-bit)</h2></b>").arg(QT_POINTER_SIZE * 8));
++    m_ui->labelName->setText(QString::fromLatin1("<b><h2>qBittorrent Enhanced Edition " QBT_VERSION " (%1-bit)</h2></b>").arg(QT_POINTER_SIZE * 8));
+ 
+     m_ui->logo->setPixmap(Utils::Gui::scaledPixmapSvg(UIThemeManager::instance()->getIconPath(QLatin1String("qbittorrent-tray")), this, 32));
+ 
+@@ -61,13 +61,17 @@ AboutDialog::AboutDialog(QWidget *parent)
+         "<tr><td>%3</td><td><a href=\"https://www.qbittorrent.org\">https://www.qbittorrent.org</a></td></tr>"
+         "<tr><td>%4</td><td><a href=\"http://forum.qbittorrent.org\">http://forum.qbittorrent.org</a></td></tr>"
+         "<tr><td>%5</td><td><a href=\"http://bugs.qbittorrent.org\">http://bugs.qbittorrent.org</a></td></tr>"
++        "<tr><td>%6</td><td><a href=\"https://github.com/c0re100/qBittorrent-Enhanced-Edition\">GitHub Repository</a></td></tr>"
++        "<tr><td>%7</td><td><a href=\"https://t.me/loli_make_the_world_great_again\">Husky</a></td></tr>"
+         "</table>"
+         "</p>")
+         .arg(tr("An advanced BitTorrent client programmed in C++, based on Qt toolkit and libtorrent-rasterbar.")
+             , tr("Copyright %1 2006-2021 The qBittorrent project").arg(QString::fromUtf8(C_COPYRIGHT))
+             , tr("Home Page:")
+             , tr("Forum:")
+-            , tr("Bug Tracker:"));
++            , tr("Bug Tracker:")
++            , tr("Enhanced Edition:")
++            , tr("Maintainer:"));
+     m_ui->labelAbout->setText(aboutText);
+ 
+     m_ui->labelMascot->setPixmap(Utils::Gui::scaledPixmap(":/icons/mascot.png", this));
+diff --git a/src/gui/advancedsettings.cpp b/src/gui/advancedsettings.cpp
+index c975a1b024e..4cee425236b 100644
+--- a/src/gui/advancedsettings.cpp
++++ b/src/gui/advancedsettings.cpp
+@@ -72,6 +72,8 @@ namespace
+         SAVE_RESUME_DATA_INTERVAL,
+         CONFIRM_RECHECK_TORRENT,
+         RECHECK_COMPLETED,
++        CONFIRM_AUTO_BAN_UNKNOWN_PEER,
++        CONFIRM_AUTO_BAN_BT_Player,
+         // UI related
+         LIST_REFRESH,
+         RESOLVE_HOSTS,
+@@ -269,6 +271,10 @@ void AdvancedSettings::saveAdvancedSettings()
+     session->setMaxConcurrentHTTPAnnounces(m_spinBoxMaxConcurrentHTTPAnnounces.value());
+     // Stop tracker timeout
+     session->setStopTrackerTimeout(m_spinBoxStopTrackerTimeout.value());
++    // Auto ban Unknown Peer
++    session->setAutoBanUnknownPeer(m_autoBanUnknownPeer.isChecked());
++    // Auto ban Bittorrent Media Player Peer
++    session->setAutoBanBTPlayerPeer(m_autoBanBTPlayerPeer.isChecked());
+     // Program notification
+     MainWindow *const mainWindow = static_cast<Application*>(QCoreApplication::instance())->mainWindow();
+     mainWindow->setNotificationsEnabled(m_checkBoxProgramNotifications.isChecked());
+@@ -622,6 +628,12 @@ void AdvancedSettings::loadAdvancedSettings()
+     addRow(ANNOUNCE_IP, (tr("IP Address to report to trackers (requires restart)")
+         + ' ' + makeLink("https://www.libtorrent.org/reference-Settings.html#announce_ip", "(?)"))
+         , &m_lineEditAnnounceIP);
++    // Auto Ban Unknown Peer from China
++    m_autoBanUnknownPeer.setChecked(session->isAutoBanUnknownPeerEnabled());
++    addRow(CONFIRM_AUTO_BAN_UNKNOWN_PEER, tr("Auto Ban Unknown Peer from China"), &m_autoBanUnknownPeer);
++    // Auto Ban Bittorrent Media Player Peer
++    m_autoBanBTPlayerPeer.setChecked(session->isAutoBanBTPlayerPeerEnabled());
++    addRow(CONFIRM_AUTO_BAN_BT_Player, tr("Auto Ban Bittorrent Media Player Peer"), &m_autoBanBTPlayerPeer);
+     // Max concurrent HTTP announces
+     m_spinBoxMaxConcurrentHTTPAnnounces.setMaximum(std::numeric_limits<int>::max());
+     m_spinBoxMaxConcurrentHTTPAnnounces.setValue(session->maxConcurrentHTTPAnnounces());
+diff --git a/src/gui/advancedsettings.h b/src/gui/advancedsettings.h
+index 428b264df69..e1ea64ed68a 100644
+--- a/src/gui/advancedsettings.h
++++ b/src/gui/advancedsettings.h
+@@ -69,7 +69,7 @@ private slots:
+               m_checkBoxProgramNotifications, m_checkBoxTorrentAddedNotifications, m_checkBoxTrackerFavicon, m_checkBoxTrackerStatus,
+               m_checkBoxConfirmTorrentRecheck, m_checkBoxConfirmRemoveAllTags, m_checkBoxAnnounceAllTrackers, m_checkBoxAnnounceAllTiers,
+               m_checkBoxMultiConnectionsPerIp, m_checkBoxValidateHTTPSTrackerCertificate, m_checkBoxBlockPeersOnPrivilegedPorts, m_checkBoxPieceExtentAffinity,
+-              m_checkBoxSuggestMode, m_checkBoxSpeedWidgetEnabled, m_checkBoxIDNSupport;
++              m_checkBoxSuggestMode, m_checkBoxSpeedWidgetEnabled, m_autoBanUnknownPeer, m_autoBanBTPlayerPeer, m_checkBoxIDNSupport;
+     QComboBox m_comboBoxInterface, m_comboBoxInterfaceAddress, m_comboBoxUtpMixedMode, m_comboBoxChokingAlgorithm, m_comboBoxSeedChokingAlgorithm;
+     QLineEdit m_lineEditAnnounceIP;
+ 
+diff --git a/src/gui/mainwindow.cpp b/src/gui/mainwindow.cpp
+index 2d7c83b1e67..a00f7680c75 100644
+--- a/src/gui/mainwindow.cpp
++++ b/src/gui/mainwindow.cpp
+@@ -156,7 +156,7 @@ MainWindow::MainWindow(QWidget *parent)
+ 
+     Preferences *const pref = Preferences::instance();
+     m_uiLocked = pref->isUILocked();
+-    setWindowTitle("qBittorrent " QBT_VERSION);
++    setWindowTitle("qBittorrent Enhanced Edition " QBT_VERSION);
+     m_displaySpeedInTitle = pref->speedInTitleBar();
+     // Setting icons
+ #ifndef Q_OS_MACOS
+@@ -1631,7 +1631,7 @@ void MainWindow::reloadSessionStats()
+ 
+     if (m_displaySpeedInTitle)
+     {
+-        setWindowTitle(tr("[D: %1, U: %2] qBittorrent %3", "D = Download; U = Upload; %3 is qBittorrent version")
++        setWindowTitle(tr("[D: %1, U: %2] qBittorrent Enhanced Edition %3", "D = Download; U = Upload; %3 is qBittorrent version")
+             .arg(Utils::Misc::friendlyUnit(status.payloadDownloadRate, true)
+                 , Utils::Misc::friendlyUnit(status.payloadUploadRate, true)
+                 , QBT_VERSION));
+@@ -1821,7 +1821,7 @@ void MainWindow::on_actionSpeedInTitleBar_triggered()
+     if (m_displaySpeedInTitle)
+         reloadSessionStats();
+     else
+-        setWindowTitle("qBittorrent " QBT_VERSION);
++        setWindowTitle("qBittorrent Enhanced Edition " QBT_VERSION);
+ }
+ 
+ void MainWindow::on_actionRSSReader_triggered()
+@@ -1918,8 +1918,9 @@ void MainWindow::handleUpdateCheckFinished(ProgramUpdater *updater, const bool i
+     const QString newVersion = updater->getNewVersion();
+     if (!newVersion.isEmpty())
+     {
++        const QString content = updater->getNewContent();
+         const QString msg {tr("A new version is available.") + "<br/>"
+-            + tr("Do you want to download %1?").arg(newVersion) + "<br/><br/>"
++            + tr("Do you want to download %1?%2").arg(newVersion).arg(content) + "<br/><br/>"
+             + QString::fromLatin1("<a href=\"https://www.qbittorrent.org/news.php\">%1</a>").arg(tr("Open changelog..."))};
+         auto *msgBox = new QMessageBox {QMessageBox::Question, tr("qBittorrent Update Available"), msg
+             , (QMessageBox::Yes | QMessageBox::No), this};
+@@ -1940,8 +1941,9 @@ void MainWindow::handleUpdateCheckFinished(ProgramUpdater *updater, const bool i
+     {
+         if (invokedByUser)
+         {
++            const QString nextUpdate = updater->getNextUpdate();
+             auto *msgBox = new QMessageBox {QMessageBox::Information, QLatin1String("qBittorrent")
+-                , tr("No updates available.\nYou are already using the latest version.")
++                , tr("No updates available.\nYou are already using the latest version.\n\n%1").arg(nextUpdate)
+                 , QMessageBox::Ok, this};
+             msgBox->setAttribute(Qt::WA_DeleteOnClose);
+             connect(msgBox, &QDialog::finished, this, cleanup);
+diff --git a/src/gui/optionsdialog.cpp b/src/gui/optionsdialog.cpp
+index 4de02aa9f9c..f2bf9f54c27 100644
+--- a/src/gui/optionsdialog.cpp
++++ b/src/gui/optionsdialog.cpp
+@@ -45,6 +45,7 @@
+ #include "base/bittorrent/session.h"
+ #include "base/global.h"
+ #include "base/net/dnsupdater.h"
++#include "base/net/downloadmanager.h"
+ #include "base/net/portforwarder.h"
+ #include "base/net/proxyconfigurationmanager.h"
+ #include "base/preferences.h"
+@@ -460,6 +461,8 @@ OptionsDialog::OptionsDialog(QWidget *parent)
+     connect(m_ui->spinSlowTorrentsInactivityTimer, qSpinBoxValueChanged, this, &ThisType::enableApplyButton);
+     connect(m_ui->checkEnableAddTrackers, &QGroupBox::toggled, this, &ThisType::enableApplyButton);
+     connect(m_ui->textTrackers, &QPlainTextEdit::textChanged, this, &ThisType::enableApplyButton);
++    connect(m_ui->checkAutoUpdateTrackers, &QGroupBox::toggled, this, &ThisType::enableApplyButton);
++    connect(m_ui->textCustomizeTrackersListUrl, &QLineEdit::textChanged, this, &ThisType::enableApplyButton);
+ 
+     const QString slowTorrentsExplanation = QLatin1String("<html><body><p>")
+             + tr("A torrent will be considered slow if its download and upload rates stay below these values for \"Torrent inactivity timer\" seconds")
+@@ -816,6 +819,8 @@ void OptionsDialog::saveOptions()
+         EnableSuperSeeding
+     };
+     session->setMaxRatioAction(actIndex.value(m_ui->comboRatioLimitAct->currentIndex()));
++    session->setAutoUpdateTrackersEnabled(m_ui->checkAutoUpdateTrackers->isChecked());
++    pref->setCustomizeTrackersListUrl(m_ui->textCustomizeTrackersListUrl->text());
+     // End Bittorrent preferences
+ 
+     // Misc preferences
+@@ -1237,6 +1242,9 @@ void OptionsDialog::loadOptions()
+         {EnableSuperSeeding, 3}
+     };
+     m_ui->comboRatioLimitAct->setCurrentIndex(actIndex.value(session->maxRatioAction()));
++    m_ui->checkAutoUpdateTrackers->setChecked(session->isAutoUpdateTrackersEnabled());
++    m_ui->textCustomizeTrackersListUrl->setText(pref->customizeTrackersListUrl());
++    m_ui->textPublicTrackers->setPlainText(session->publicTrackers());
+     // End Bittorrent preferences
+ 
+     // Web UI preferences
+@@ -1871,3 +1879,23 @@ void OptionsDialog::on_IPSubnetWhitelistButton_clicked()
+     connect(dialog, &QDialog::accepted, this, &OptionsDialog::enableApplyButton);
+     dialog->open();
+ }
++
++void OptionsDialog::on_fetchButton_clicked()
++{
++    Net::DownloadHandler *m_fetchHandler = Net::DownloadManager::instance()->download(Preferences::instance()->customizeTrackersListUrl());
++    connect(m_fetchHandler, &Net::DownloadHandler::finished, this, &OptionsDialog::handlePublicTrackersListChanged);
++}
++
++void OptionsDialog::handlePublicTrackersListChanged(const Net::DownloadResult &result)
++{
++    switch (result.status) {
++        case Net::DownloadStatus::Success:
++            BitTorrent::Session::instance()->setPublicTrackers(QString::fromUtf8(result.data.data()));
++            m_ui->textPublicTrackers->setPlainText(QString::fromUtf8(result.data.data()));
++            m_ui->fetchButton->setEnabled(false);
++            m_ui->fetchButton->setText("Fetched!");
++            break;
++        default:
++            m_ui->textPublicTrackers->setPlainText("Refetch failed. Reason: " + result.errorString);
++    }
++}
+diff --git a/src/gui/optionsdialog.h b/src/gui/optionsdialog.h
+index b9c374be367..ae97059165c 100644
+--- a/src/gui/optionsdialog.h
++++ b/src/gui/optionsdialog.h
+@@ -31,6 +31,7 @@
+ #include <QDialog>
+ 
+ #include "base/settingvalue.h"
++#include "base/net/downloadmanager.h"
+ 
+ class QCloseEvent;
+ class QListWidgetItem;
+@@ -111,6 +112,8 @@ private slots:
+     void setLocale(const QString &localeStr);
+     void webUIHttpsCertChanged(const QString &path, ShowError showError);
+     void webUIHttpsKeyChanged(const QString &path, ShowError showError);
++    void on_fetchButton_clicked();
++    void handlePublicTrackersListChanged(const Net::DownloadResult &result);
+ 
+ private:
+     // Methods
+diff --git a/src/gui/optionsdialog.ui b/src/gui/optionsdialog.ui
+index f27359d1582..79f618ca510 100644
+--- a/src/gui/optionsdialog.ui
++++ b/src/gui/optionsdialog.ui
+@@ -122,8 +122,8 @@
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>501</width>
+-             <height>893</height>
++             <width>470</width>
++             <height>909</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_9">
+@@ -735,8 +735,8 @@
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>591</width>
+-             <height>1138</height>
++             <width>470</width>
++             <height>1066</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout">
+@@ -1382,8 +1382,8 @@ Manual: Various torrent properties (e.g. save path) must be assigned manually</s
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>501</width>
+-             <height>745</height>
++             <width>470</width>
++             <height>624</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_20">
+@@ -1882,8 +1882,8 @@ Manual: Various torrent properties (e.g. save path) must be assigned manually</s
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>516</width>
+-             <height>525</height>
++             <width>487</width>
++             <height>542</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_5">
+@@ -2218,9 +2218,9 @@ Manual: Various torrent properties (e.g. save path) must be assigned manually</s
+            <property name="geometry">
+             <rect>
+              <x>0</x>
+-             <y>0</y>
+-             <width>513</width>
+-             <height>679</height>
++             <y>-298</y>
++             <width>470</width>
++             <height>840</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_7">
+@@ -2675,6 +2675,72 @@ Disable encryption: Only connect to peers without protocol encryption</string>
+               </layout>
+              </widget>
+             </item>
++            <item>
++             <widget class="QGroupBox" name="checkAutoUpdateTrackers">
++              <property name="title">
++               <string>Automatically update public trackers list:</string>
++              </property>
++              <property name="checkable">
++               <bool>true</bool>
++              </property>
++              <property name="checked">
++               <bool>false</bool>
++              </property>
++              <layout class="QGridLayout" name="gridLayout_999">
++               <property name="leftMargin">
++                <number>9</number>
++               </property>
++               <property name="topMargin">
++                <number>9</number>
++               </property>
++               <property name="rightMargin">
++                <number>9</number>
++               </property>
++               <property name="bottomMargin">
++                <number>9</number>
++               </property>
++               <item row="0" column="0">
++                <widget class="QLineEdit" name="textCustomizeTrackersListUrl">
++                 <property name="enabled">
++                  <bool>true</bool>
++                 </property>
++                 <property name="text">
++                  <string>https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt</string>
++                 </property>
++                 <property name="readOnly">
++                  <bool>false</bool>
++                 </property>
++                 <property name="cursorMoveStyle">
++                  <enum>Qt::LogicalMoveStyle</enum>
++                 </property>
++                </widget>
++               </item>
++               <item row="0" column="1">
++                <widget class="QPushButton" name="fetchButton">
++                 <property name="text">
++                  <string>Refetch</string>
++                 </property>
++                </widget>
++               </item>
++               <item row="1" column="0" colspan="2">
++                <widget class="QPlainTextEdit" name="textPublicTrackers">
++                 <property name="enabled">
++                  <bool>true</bool>
++                 </property>
++                 <property name="minimumSize">
++                  <size>
++                   <width>0</width>
++                   <height>153</height>
++                  </size>
++                 </property>
++                 <property name="readOnly">
++                  <bool>true</bool>
++                 </property>
++                </widget>
++               </item>
++              </layout>
++             </widget>
++            </item>
+             <item>
+              <spacer name="verticalSpacer_8">
+               <property name="orientation">
+@@ -2718,8 +2784,8 @@ Disable encryption: Only connect to peers without protocol encryption</string>
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>516</width>
+-             <height>525</height>
++             <width>487</width>
++             <height>542</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_27">
+@@ -2888,8 +2954,8 @@ Disable encryption: Only connect to peers without protocol encryption</string>
+             <rect>
+              <x>0</x>
+              <y>0</y>
+-             <width>501</width>
+-             <height>636</height>
++             <width>470</width>
++             <height>903</height>
+             </rect>
+            </property>
+            <layout class="QVBoxLayout" name="verticalLayout_23">
+diff --git a/src/gui/programupdater.cpp b/src/gui/programupdater.cpp
+index 7301b83ea9f..1d054dead7f 100644
+--- a/src/gui/programupdater.cpp
++++ b/src/gui/programupdater.cpp
+@@ -75,11 +75,11 @@ namespace
+ 
+ void ProgramUpdater::checkForUpdates() const
+ {
+-    const auto RSS_URL = QString::fromLatin1("https://www.fosshub.com/feed/5b8793a7f9ee5a5c3e97a3b2.xml");
++    const auto RSS_URL = QString::fromLatin1("https://husky.moe/feedqBittorent.xml");
+     // Don't change this User-Agent. In case our updater goes haywire,
+     // the filehost can identify it and contact us.
+     Net::DownloadManager::instance()->download(
+-        Net::DownloadRequest(RSS_URL).userAgent("qBittorrent/" QBT_VERSION_2 " ProgramUpdater (www.qbittorrent.org)")
++        Net::DownloadRequest(RSS_URL).userAgent("qBittorrent Enhanced/" QBT_VERSION_2 " ProgramUpdater (www.qbittorrent.org)")
+         , this, &ProgramUpdater::rssDownloadFinished);
+ }
+ 
+@@ -88,6 +88,16 @@ QString ProgramUpdater::getNewVersion() const
+     return m_newVersion;
+ }
+ 
++QString ProgramUpdater::getNewContent() const
++{
++  return m_content;
++}
++
++QString ProgramUpdater::getNextUpdate() const
++{
++  return m_nextUpdate;
++}
++
+ void ProgramUpdater::rssDownloadFinished(const Net::DownloadResult &result)
+ {
+     if (result.status != Net::DownloadStatus::Success)
+@@ -117,6 +127,8 @@ void ProgramUpdater::rssDownloadFinished(const Net::DownloadResult &result)
+ 
+     bool inItem = false;
+     QString version;
++    QString content;
++    QString nextUpdate;
+     QString updateLink;
+     QString type;
+     QXmlStreamReader xml(result.data);
+@@ -135,6 +147,10 @@ void ProgramUpdater::rssDownloadFinished(const Net::DownloadResult &result)
+                 type = getStringValue(xml);
+             else if (inItem && xml.name() == "version")
+                 version = getStringValue(xml);
++            else if (inItem && xml.name() == "content")
++                content = getStringValue(xml);
++            else if (inItem && xml.name() == "update")
++                nextUpdate = getStringValue(xml);
+         }
+         else if (xml.isEndElement())
+         {
+@@ -150,7 +166,9 @@ void ProgramUpdater::rssDownloadFinished(const Net::DownloadResult &result)
+                         {
+                             m_newVersion = version;
+                             m_updateURL = updateLink;
++                            m_content = content;
+                         }
++                        m_nextUpdate = nextUpdate;
+                     }
+                     break;
+                 }
+@@ -159,6 +177,8 @@ void ProgramUpdater::rssDownloadFinished(const Net::DownloadResult &result)
+                 updateLink.clear();
+                 type.clear();
+                 version.clear();
++                content.clear();
++                nextUpdate.clear();
+             }
+         }
+     }
+diff --git a/src/gui/programupdater.h b/src/gui/programupdater.h
+index 1a22886a42b..5d2a09a398f 100644
+--- a/src/gui/programupdater.h
++++ b/src/gui/programupdater.h
+@@ -48,6 +48,8 @@ class ProgramUpdater final : public QObject
+ 
+     void checkForUpdates() const;
+     QString getNewVersion() const;
++    QString getNewContent() const;
++    QString getNextUpdate() const;
+     bool updateProgram() const;
+ 
+ signals:
+@@ -58,5 +60,7 @@ private slots:
+ 
+ private:
+     QString m_newVersion;
++    QString m_nextUpdate;
++    QString m_content;
+     QUrl m_updateURL;
+ };
+diff --git a/src/gui/properties/peerlistwidget.cpp b/src/gui/properties/peerlistwidget.cpp
+index d031e3917d8..f57d2b40c93 100644
+--- a/src/gui/properties/peerlistwidget.cpp
++++ b/src/gui/properties/peerlistwidget.cpp
+@@ -98,6 +98,7 @@ PeerListWidget::PeerListWidget(PropertiesWidget *parent)
+     m_listModel->setHeaderData(PeerListColumns::FLAGS, Qt::Horizontal, tr("Flags"));
+     m_listModel->setHeaderData(PeerListColumns::CONNECTION, Qt::Horizontal, tr("Connection"));
+     m_listModel->setHeaderData(PeerListColumns::CLIENT, Qt::Horizontal, tr("Client", "i.e.: Client application"));
++    m_listModel->setHeaderData(PeerListColumns::PEERID, Qt::Horizontal, tr("Peer ID", "i.e.: Client Peer ID"));
+     m_listModel->setHeaderData(PeerListColumns::PROGRESS, Qt::Horizontal, tr("Progress", "i.e: % downloaded"));
+     m_listModel->setHeaderData(PeerListColumns::DOWN_SPEED, Qt::Horizontal, tr("Down Speed", "i.e: Download speed"));
+     m_listModel->setHeaderData(PeerListColumns::UP_SPEED, Qt::Horizontal, tr("Up Speed", "i.e: Upload speed"));
+@@ -305,14 +306,28 @@ void PeerListWidget::banSelectedPeers()
+     // Store selected rows first as selected peers may disconnect
+     const QModelIndexList selectedIndexes = selectionModel()->selectedRows();
+ 
+-    QVector<QString> selectedIPs;
+-    selectedIPs.reserve(selectedIndexes.size());
++    struct selectedData {
++      QString ip;
++      QString client;
++      QString peerId;
++      QString country;
++    };
++
++    QVector<selectedData> selectedDatas;
++    selectedDatas.reserve(selectedIndexes.size());
+ 
+     for (const QModelIndex &index : selectedIndexes)
+     {
+         const int row = m_proxyModel->mapToSource(index).row();
+         const QString ip = m_listModel->item(row, PeerListColumns::IP_HIDDEN)->text();
+-        selectedIPs += ip;
++        const QString client = m_listModel->item(row, PeerListColumns::CLIENT)->text();
++        const QString peerId = m_listModel->item(row, PeerListColumns::PEERID)->text();
++
++        QHostAddress host(ip);
++        const QString country = Net::GeoIPManager::CountryName(Net::GeoIPManager::instance()->lookup(host));
++
++        selectedData tmp{ip, client, peerId, country};
++        selectedDatas += tmp;
+     }
+ 
+     // Confirm before banning peer
+@@ -320,10 +335,10 @@ void PeerListWidget::banSelectedPeers()
+         , tr("Are you sure you want to permanently ban the selected peers?"));
+     if (btn != QMessageBox::Yes) return;
+ 
+-    for (const QString &ip : selectedIPs)
++    for (const selectedData &data : selectedDatas)
+     {
+-        BitTorrent::Session::instance()->banIP(ip);
+-        LogMsg(tr("Peer \"%1\" is manually banned").arg(ip));
++        BitTorrent::Session::instance()->banIP(data.ip);
++        LogMsg(tr("Peer \"%1\" is manually banned. PeerID: '%2' Client: '%3' Country: '%4'").arg(data.ip).arg(data.peerId).arg(data.client).arg(data.country));
+     }
+     // Refresh list
+     loadPeers(m_properties->getCurrentTorrent());
+@@ -448,6 +463,8 @@ void PeerListWidget::updatePeer(const BitTorrent::Torrent *torrent, const BitTor
+     setModelData(row, PeerListColumns::FLAGS, peer.flags(), peer.flags(), {}, peer.flagsDescription());
+     const QString client = peer.client().toHtmlEscaped();
+     setModelData(row, PeerListColumns::CLIENT, client, client);
++    const QString peerId = peer.peerId().toHtmlEscaped();
++    setModelData(row, PeerListColumns::PEERID, peerId, peerId);
+     setModelData(row, PeerListColumns::PROGRESS, (Utils::String::fromDouble(peer.progress() * 100, 1) + '%'), peer.progress(), intDataTextAlignment);
+     const QString downSpeed = (hideValues && (peer.payloadDownSpeed() <= 0)) ? QString {} : Utils::Misc::friendlyUnit(peer.payloadDownSpeed(), true);
+     setModelData(row, PeerListColumns::DOWN_SPEED, downSpeed, peer.payloadDownSpeed(), intDataTextAlignment);
+diff --git a/src/gui/properties/peerlistwidget.h b/src/gui/properties/peerlistwidget.h
+index 28ae98b5106..aeb52167a0a 100644
+--- a/src/gui/properties/peerlistwidget.h
++++ b/src/gui/properties/peerlistwidget.h
+@@ -65,6 +65,7 @@ class PeerListWidget final : public QTreeView
+         CONNECTION,
+         FLAGS,
+         CLIENT,
++        PEERID,
+         PROGRESS,
+         DOWN_SPEED,
+         UP_SPEED,
+diff --git a/src/src.pro b/src/src.pro
+index 0e265e615dd..bd22d1a0d8e 100644
+--- a/src/src.pro
++++ b/src/src.pro
+@@ -8,6 +8,7 @@ macx: include(../macxconf.pri)
+ unix:!macx: include(../unixconf.pri)
+ 
+ QT += network xml
++QT += sql
+ 
+ macx|*-clang*: QMAKE_CXXFLAGS_WARN_ON += -Wno-range-loop-analysis
+ 
+diff --git a/src/webui/api/appcontroller.cpp b/src/webui/api/appcontroller.cpp
+index 3a3c01b0473..6b4bc9ab5ce 100644
+--- a/src/webui/api/appcontroller.cpp
++++ b/src/webui/api/appcontroller.cpp
+@@ -170,6 +170,8 @@ void AppController::preferencesAction()
+     data["ip_filter_path"] = Utils::Fs::toNativePath(session->IPFilterFile());
+     data["ip_filter_trackers"] = session->isTrackerFilteringEnabled();
+     data["banned_IPs"] = session->bannedIPs().join('\n');
++    data["auto_ban_unknown_peer"] = session->isAutoBanUnknownPeerEnabled();
++    data["auto_ban_bt_player_peer"] = session->isAutoBanBTPlayerPeerEnabled();
+ 
+     // Speed
+     // Global Rate Limits
+@@ -216,6 +218,9 @@ void AppController::preferencesAction()
+     // Add trackers
+     data["add_trackers_enabled"] = session->isAddTrackersEnabled();
+     data["add_trackers"] = session->additionalTrackers();
++    data["auto_update_trackers_enabled"] = session->isAutoUpdateTrackersEnabled();
++    data["customize_trackers_list_url"] = pref->customizeTrackersListUrl();
++    data["public_trackers"] = session->publicTrackers();
+ 
+     // Web UI
+     // Language
+@@ -503,6 +508,10 @@ void AppController::setPreferencesAction()
+         session->setTrackerFilteringEnabled(it.value().toBool());
+     if (hasKey("banned_IPs"))
+         session->setBannedIPs(it.value().toString().split('\n', QString::SkipEmptyParts));
++    if (hasKey("auto_ban_unknown_peer"))
++        session->setAutoBanUnknownPeer(it.value().toBool());
++    if (hasKey("auto_ban_bt_player_peer"))
++        session->setAutoBanBTPlayerPeer(it.value().toBool());
+ 
+     // Speed
+     // Global Rate Limits
+@@ -583,6 +592,10 @@ void AppController::setPreferencesAction()
+         session->setAddTrackersEnabled(it.value().toBool());
+     if (hasKey("add_trackers"))
+         session->setAdditionalTrackers(it.value().toString());
++    if (hasKey("auto_update_trackers_enabled"))
++        session->setAutoUpdateTrackersEnabled(it.value().toBool());
++    if (hasKey("customize_trackers_list_url"))
++        pref->setCustomizeTrackersListUrl(it.value().toString());
+ 
+     // Web UI
+     // Language
+diff --git a/src/webui/api/synccontroller.cpp b/src/webui/api/synccontroller.cpp
+index 7f7798abeab..4f1e2a0cac4 100644
+--- a/src/webui/api/synccontroller.cpp
++++ b/src/webui/api/synccontroller.cpp
+@@ -63,6 +63,7 @@ namespace
+ 
+     // Peer keys
+     const char KEY_PEER_CLIENT[] = "client";
++    const char KEY_PEER_ID[] = "peer_id";
+     const char KEY_PEER_CONNECTION_TYPE[] = "connection";
+     const char KEY_PEER_COUNTRY[] = "country";
+     const char KEY_PEER_COUNTRY_CODE[] = "country_code";
+@@ -564,6 +565,7 @@ void SyncController::torrentPeersAction()
+             {KEY_PEER_IP, pi.address().ip.toString()},
+             {KEY_PEER_PORT, pi.address().port},
+             {KEY_PEER_CLIENT, pi.client()},
++            {KEY_PEER_ID, pi.peerId()},
+             {KEY_PEER_PROGRESS, pi.progress()},
+             {KEY_PEER_DOWN_SPEED, pi.payloadDownSpeed()},
+             {KEY_PEER_UP_SPEED, pi.payloadUpSpeed()},
+diff --git a/src/webui/www/private/index.html b/src/webui/www/private/index.html
+index aa01441e5f7..b4ec3ac4c12 100644
+--- a/src/webui/www/private/index.html
++++ b/src/webui/www/private/index.html
+@@ -4,7 +4,7 @@
+ <head>
+     <meta charset="UTF-8" />
+     <meta http-equiv="X-UA-Compatible" content="IE=10" />
+-    <title>qBittorrent Web UI</title>
++    <title>qBittorrent Enhanced Edition Web UI</title>
+     <link rel="icon" type="image/png" href="images/qbittorrent32.png" />
+     <link rel="icon" type="image/svg+xml" href="icons/qbittorrent-tray.svg" />
+     <link rel="stylesheet" type="text/css" href="css/dynamicTable.css?v=${CACHEID}" />
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index e2d8c90abd6..95cdb69730b 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -1402,6 +1402,7 @@ window.qBittorrent.DynamicTable = (function() {
+             this.newColumn('connection', '', 'QBT_TR(Connection)QBT_TR[CONTEXT=PeerListWidget]', 50, true);
+             this.newColumn('flags', '', 'QBT_TR(Flags)QBT_TR[CONTEXT=PeerListWidget]', 50, true);
+             this.newColumn('client', '', 'QBT_TR(Client)QBT_TR[CONTEXT=PeerListWidget]', 140, true);
++            this.newColumn('peer_id', '', 'QBT_TR(Peer ID)QBT_TR[CONTEXT=PeerListWidget]', 60, true);
+             this.newColumn('progress', '', 'QBT_TR(Progress)QBT_TR[CONTEXT=PeerListWidget]', 50, true);
+             this.newColumn('dl_speed', '', 'QBT_TR(Down Speed)QBT_TR[CONTEXT=PeerListWidget]', 50, true);
+             this.newColumn('up_speed', '', 'QBT_TR(Up Speed)QBT_TR[CONTEXT=PeerListWidget]', 50, true);
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index 77e9f6b1b09..c816a32be1d 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -581,6 +581,25 @@
+         </legend>
+         <textarea id="add_trackers_textarea" rows="5" cols="70"></textarea>
+     </fieldset>
++
++    <fieldset class="settings">
++        <legend><input type="checkbox" id="auto_update_trackers_checkbox" />
++            <label for="auto_update_trackers_checkbox">QBT_TR(Automatically update public trackers list:)QBT_TR[CONTEXT=OptionsDialog]</label>
++        </legend>
++        <table>
++            <tr>
++                <td>
++                    Customize Trackers List Url:
++                    <input type="text" id="customize_trackers_list_url" style="width: 40em;" />
++                </td>
++            </tr>
++            <tr>
++                <td>
++                    <textarea id="public_trackers_textarea" rows="5" cols="70" readonly></textarea>
++                </td>
++            </tr>
++        </table>
++    </fieldset>
+ </div>
+ 
+ <div id="RSSTab" class="PrefTab invisible">
+@@ -938,6 +957,22 @@
+                     <input type="text" id="embeddedTrackerPort" style="width: 15em;" />
+                 </td>
+             </tr>
++            <tr>
++                <td>
++                    <label for="autoBanUnknownPeer">QBT_TR(Auto Ban Unknown Client From China:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                </td>
++                <td>
++                    <input type="checkbox" id="autoBanUnknownPeer">
++                </td>
++            </tr>
++            <tr>
++                <td>
++                    <label for="autoBanBittorrentPlayer">QBT_TR(Auto Ban Bittorrent Media Player:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                </td>
++                <td>
++                    <input type="checkbox" id="autoBanBittorrentPlayer">
++                </td>
++            </tr>
+         </table>
+     </fieldset>
+     <fieldset class="settings">
+@@ -1816,6 +1851,9 @@
+                         // Add trackers
+                         $('add_trackers_checkbox').setProperty('checked', pref.add_trackers_enabled);
+                         $('add_trackers_textarea').setProperty('value', pref.add_trackers);
++                        $('auto_update_trackers_checkbox').setProperty('checked', pref.auto_update_trackers_enabled);
++                        $('public_trackers_textarea').setProperty('value', pref.public_trackers);
++                        $('customize_trackers_list_url').setProperty('value', pref.customize_trackers_list_url);
+                         updateAddTrackersEnabled();
+ 
+                         // RSS Tab
+@@ -1882,6 +1920,8 @@
+                         $('saveResumeDataInterval').setProperty('value', pref.save_resume_data_interval);
+                         $('recheckTorrentsOnCompletion').setProperty('checked', pref.recheck_completed_torrents);
+                         $('resolvePeerCountries').setProperty('checked', pref.resolve_peer_countries);
++                        $('autoBanUnknownPeer').setProperty('checked', pref.auto_ban_unknown_peer);
++                        $('autoBanBittorrentPlayer').setProperty('checked', pref.auto_ban_bt_player_peer);
+                         // libtorrent section
+                         $('asyncIOThreads').setProperty('value', pref.async_io_threads);
+                         $('hashingThreads').setProperty('value', pref.hashing_threads);
+@@ -2186,6 +2226,8 @@
+             // Add trackers
+             settings.set('add_trackers_enabled', $('add_trackers_checkbox').getProperty('checked'));
+             settings.set('add_trackers', $('add_trackers_textarea').getProperty('value'));
++            settings.set('auto_update_trackers_enabled', $('auto_update_trackers_checkbox').getProperty('checked'));
++            settings.set('customize_trackers_list_url', $('customize_trackers_list_url').getProperty('value'));
+ 
+             // RSS Tab
+             settings.set('rss_processing_enabled', $('enable_fetching_rss_feeds_checkbox').getProperty('checked'));
+@@ -2270,6 +2312,8 @@
+             settings.set('save_resume_data_interval', $('saveResumeDataInterval').getProperty('value'));
+             settings.set('recheck_completed_torrents', $('recheckTorrentsOnCompletion').getProperty('checked'));
+             settings.set('resolve_peer_countries', $('resolvePeerCountries').getProperty('checked'));
++            settings.set('auto_ban_unknown_peer', $('autoBanUnknownPeer').getProperty('checked'));
++            settings.set('auto_ban_bt_player_peer', $('autoBanBittorrentPlayer').getProperty('checked'));
+ 
+             // libtorrent section
+             settings.set('async_io_threads', $('asyncIOThreads').getProperty('value'));
+diff --git a/src/webui/www/public/index.html b/src/webui/www/public/index.html
+index e08289abcd5..39b3b509447 100644
+--- a/src/webui/www/public/index.html
++++ b/src/webui/www/public/index.html
+@@ -3,7 +3,7 @@
+ 
+ <head>
+     <meta charset="UTF-8" />
+-    <title>qBittorrent QBT_TR(Web UI)QBT_TR[CONTEXT=OptionsDialog]</title>
++    <title>qBittorrent Enhanced Edition QBT_TR(Web UI)QBT_TR[CONTEXT=OptionsDialog]</title>
+     <link rel="icon" type="image/png" href="images/qbittorrent32.png" />
+     <link rel="icon" type="image/svg+xml" href="icons/qbittorrent-tray.svg" />
+     <link rel="stylesheet" type="text/css" href="css/login.css?v=${CACHEID}" />
